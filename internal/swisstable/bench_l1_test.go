@@ -236,6 +236,7 @@ func l1DropCache(f *os.File) {
 
 type l1Result struct {
 	Label          string  `json:"label"`
+	Impl           string  `json:"impl"`
 	Commit         string  `json:"commit"`
 	N              uint64  `json:"n"`
 	Presize        uint64  `json:"presize"`
@@ -303,6 +304,7 @@ func BenchmarkL1Posmap(b *testing.B) {
 	n := l1EnvU64("BENCH_N", 1_000_000)
 	presize := l1EnvU64("BENCH_PRESIZE", 2*n)
 	mode := l1EnvStr("BENCH_MODE", "A")
+	impl := l1EnvStr("BENCH_IMPL", "swiss")
 	mix := l1EnvStr("BENCH_MIX", "add")
 	seed := l1EnvU64("BENCH_SEED", 0xC0C0_1234)
 	dir := l1EnvStr("BENCH_DIR", "")
@@ -316,14 +318,7 @@ func BenchmarkL1Posmap(b *testing.B) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		b.Fatal(err)
 	}
-	ctrlPath := filepath.Join(dir, "ctrl.dat")
-	slotsPath := filepath.Join(dir, "slots.dat")
 	dataPath := filepath.Join(dir, "data.dat")
-
-	// Fresh position map files every run so expectedEntries takes effect
-	// (openFiles reuses existing files regardless of expectedEntries).
-	os.Remove(ctrlPath)
-	os.Remove(slotsPath)
 
 	// --- keys / data file -------------------------------------------------
 	keys := make([]byte, n*32)
@@ -387,7 +382,11 @@ func BenchmarkL1Posmap(b *testing.B) {
 
 	// --- construct map ----------------------------------------------------
 	tSetup := time.Now()
-	m, _, err := NewSwissPositionMap(ctrlPath, slotsPath, presize, [32]byte{}, src, testPositionMask)
+	sizeHint := presize
+	if impl != "swiss" {
+		sizeHint = n // alt structures are sized by live count, not presize
+	}
+	m, err := l1NewImpl(impl, dir, sizeHint, src, testPositionMask)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -396,8 +395,7 @@ func BenchmarkL1Posmap(b *testing.B) {
 
 	if cold {
 		// Undo MAP_POPULATE warmup so the measured loop sees cold pages.
-		l1DropCache(m.ctrlFile)
-		l1DropCache(m.slotsFile)
+		m.DropCache()
 	}
 
 	// --- timed replay -----------------------------------------------------
@@ -453,8 +451,13 @@ func BenchmarkL1Posmap(b *testing.B) {
 		meanus = float64(sum) / float64(len(durations)) / 1000
 	}
 
-	ctrlBytes := uint64(fileHeaderSize) + m.numSlots
-	slotsBytes := uint64(fileHeaderSize) + m.numSlots*8
+	numSlots := m.NumSlots()
+	mapBytes := m.MapBytes()
+	var ctrlBytes, slotsBytes uint64
+	if impl == "swiss" {
+		ctrlBytes = uint64(fileHeaderSize) + numSlots
+		slotsBytes = uint64(fileHeaderSize) + numSlots*8
+	}
 
 	majFlt := after.MajFlt - before.MajFlt
 	minFlt := after.MinFlt - before.MinFlt
@@ -476,10 +479,11 @@ func BenchmarkL1Posmap(b *testing.B) {
 		Errors:         errs,
 		GetsFound:      getsFound,
 		DelsDone:       delsDone,
-		NumSlots:       m.numSlots,
+		Impl:           impl,
+		NumSlots:       numSlots,
 		CtrlBytes:      ctrlBytes,
 		SlotsBytes:     slotsBytes,
-		MapTotalBytes:  ctrlBytes + slotsBytes,
+		MapTotalBytes:  mapBytes,
 		SetupSeconds:   setupDur.Seconds(),
 		TotalSeconds:   secs,
 		OpsPerSec:      float64(len(ops)) / secs,

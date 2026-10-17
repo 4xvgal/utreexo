@@ -13,6 +13,11 @@
 # Guest RAM is deliberately small (3GiB). The cgroup MemoryMax cap (default 2G)
 # is what forces page-cache eviction and reproduces the random-I/O wall. The
 # 55GB posmap files are sparse: real disk use ≈ 8KiB * N per run.
+#
+# Implementations (BENCH_IMPL):
+#   swiss  production SwissPositionMap (BENCH_PRESIZE controls the presize)
+#   lh     linear hashing (one bucket split at a time, no presize)
+#   bbolt  go.etcd.io/bbolt B+tree (stores keys, no verifyHash)
 set -euo pipefail
 
 VM=${VM:-posmap-bench}
@@ -26,8 +31,10 @@ OUT="$GH/bench/l1-native.jsonl"
 
 # Heuristic: N * 8KiB (~dirty/writeback volume) should exceed the cgroup budget.
 # N=262144, M=2G  =>  working set ~2GiB  =>  1x budget (I/O bound, reproducible).
+# The real failure point (H~178k) is N=1680000 with M=2G (working set ~13GiB).
 N=${N:-262144}
 MEM=${MEM:-2G}
+MIXES=${MIXES:-"add 2:1"}   # 1:1 is degenerate: the balanced random walk keeps the live set ~sqrt(N)
 
 limactl list "$VM" >/dev/null 2>&1 || {
   echo "VM '$VM' not found. Create it first:" >&2
@@ -50,28 +57,31 @@ fi
 git -C $SRC checkout -q v0.18.0
 EOF
 
-echo "==> copy bench file + build"
-limactl copy "$REPO/internal/swisstable/bench_l1_test.go" "$VM:$SRC/internal/swisstable/bench_l1_test.go"
-limactl shell "$VM" -- bash -c "export PATH=\$PATH:/usr/local/go/bin; mkdir -p $BENCH; cd $SRC && go test -c -o $BENCH/bench_l1.test ./internal/swisstable"
+echo "==> copy sources + build"
+for f in internal/swisstable/bench_l1_test.go internal/swisstable/bench_l1_alt_test.go go.mod go.sum; do
+  limactl copy "$REPO/$f" "$VM:$SRC/$f"
+done
+limactl shell "$VM" -- bash -c "export PATH=\$PATH:/usr/local/go/bin; mkdir -p $BENCH; cd $SRC && go mod download && go test -c -o $BENCH/bench_l1.test ./internal/swisstable"
 
-run() { # label n presize mix mem
-  local label=$1 n=$2 pre=$3 mix=$4 mem=$5
-  echo "==> $label (N=$n presize=$pre mix=$mix mem=$mem)"
+run() { # label n impl presize mix mem
+  local label=$1 n=$2 impl=$3 pre=$4 mix=$5 mem=$6
+  echo "==> $label (N=$n impl=$impl presize=$pre mix=$mix mem=$mem)"
   limactl shell "$VM" -- bash -c "
     rm -rf $BENCH/data/$label; sync; sleep 10
     sudo systemd-run --unit=l1bench --wait --pipe --collect \
       --property=MemoryMax=$mem --property=MemorySwapMax=0 \
-      env BENCH_DIR=$BENCH/data/$label BENCH_N=$n BENCH_PRESIZE=$pre \
+      env BENCH_IMPL=$impl BENCH_DIR=$BENCH/data/$label BENCH_N=$n BENCH_PRESIZE=$pre \
           BENCH_MIX=$mix BENCH_MODE=A BENCH_LABEL=$label BENCH_COLD=1 BENCH_OUT=$OUT \
       $BENCH/bench_l1.test -test.run '^\$' -test.bench '^BenchmarkL1Posmap\$' -test.benchtime 1x
     sync; sleep 5" | grep L1RESULT || true
 }
 
 limactl shell "$VM" -- bash -c "rm -f $OUT"
-for mix in add 1:1; do
-  run "p32-$mix"   "$N" 4294967296 "$mix" "$MEM"   # baseline: 2^32 presize (55GB)
-  run "sized-$mix" "$N" $((2 * N))  "$mix" "$MEM"  # ~2N entries
-  run "small-$mix" "$N" 65536       "$mix" "$MEM"  # forces x4 resize
+for mix in $MIXES; do
+  run "swiss-p32-$mix"   "$N" swiss 4294967296 "$mix" "$MEM"   # baseline: 2^32 presize (55GB)
+  run "swiss-sized-$mix" "$N" swiss $((2 * N))    "$mix" "$MEM" # ~2N entries
+  run "lh-$mix"          "$N" lh    $((2 * N))    "$mix" "$MEM"
+  run "bbolt-$mix"       "$N" bbolt $((2 * N))    "$mix" "$MEM"
 done
 
 echo "==> results"
