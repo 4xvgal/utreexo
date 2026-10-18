@@ -37,16 +37,16 @@ for f in internal/l2bench/bench_l2_test.go go.mod go.sum; do
 done
 limactl shell "$VM" -- bash -c "export PATH=\$PATH:/usr/local/go/bin; mkdir -p $BENCH; cd $SRC && go mod download && go test -c -o $BENCH/l2bench.test ./internal/l2bench"
 
-run() { # label n blocks delPct presize cacheMB forceRebuild
-  local label=$1 n=$2 blocks=$3 del=$4 pre=$5 cache=$6 rebuild=$7
-  echo "==> $label (del=$del% presize=$pre cache=${cache}MB rebuild=$rebuild)"
+run() { # label impl n blocks delPct presize cacheMB forceRebuild
+  local label=$1 impl=$2 n=$3 blocks=$4 del=$5 pre=$6 cache=$7 rebuild=$8
+  echo "==> $label (impl=$impl del=$del% presize=$pre cache=${cache}MB rebuild=$rebuild)"
   limactl shell "$VM" -- bash -c "
     sudo rm -rf $BENCH/data/$label; sync; sleep 8
     sudo systemd-run --unit=l2bench --wait --pipe --collect \
       --property=MemoryMax=$MEM --property=MemorySwapMax=0 \
       env BENCH_L2_DIR=$BENCH/data/$label BENCH_L2_N=$n BENCH_L2_BLOCKS=$blocks \
           BENCH_L2_DEL_PCT=$del BENCH_L2_PRESIZE=$pre BENCH_L2_CACHE_MB=$cache \
-          BENCH_L2_REOPEN=1 BENCH_L2_FORCE_REBUILD=$rebuild \
+          BENCH_L2_IMPL=$impl BENCH_L2_REOPEN=1 BENCH_L2_FORCE_REBUILD=$rebuild \
           BENCH_L2_LABEL=$label BENCH_L2_OUT=$OUT \
       $BENCH/l2bench.test -test.run '^\$' -test.bench '^BenchmarkL2Forest\$' -test.benchtime 1x \
       2>&1 | grep -E 'L2RESULT|FAIL|panic'
@@ -54,14 +54,17 @@ run() { # label n blocks delPct presize cacheMB forceRebuild
 }
 
 limactl shell "$VM" -- bash -c "rm -f $OUT"
-# sized (fast, cache-resident)
-run l2-sized-del0           "$N" "$BLOCKS" 0  $((2 * N)) 64  0
-run l2-sized-del30          "$N" "$BLOCKS" 30 $((2 * N)) 64  0
-run l2-sized-del30-c512     "$N" "$BLOCKS" 30 $((2 * N)) 512 0
-run l2-sized-del30-rebuild  "$N" "$BLOCKS" 30 $((2 * N)) 64  1
+# sized (fast, cache-resident) + LH alternative (L2-b interface refactor)
+run l2-sized-del0          swiss "$N" "$BLOCKS" 0  $((2 * N)) 64  0
+run l2-sized-del30         swiss "$N" "$BLOCKS" 30 $((2 * N)) 64  0
+run l2-sized-del30-c512    swiss "$N" "$BLOCKS" 30 $((2 * N)) 512 0
+run l2-sized-del30-rebuild swiss "$N" "$BLOCKS" 30 $((2 * N)) 64  1
+run l2-lh-del0             lh    "$N" "$BLOCKS" 0  $((2 * N)) 64  0
+run l2-lh-del30            lh    "$N" "$BLOCKS" 30 $((2 * N)) 64  0
+run l2-lh-rebuild          lh    "$N" "$BLOCKS" 30 $((2 * N)) 64  1
 # failure point (I/O bound, ~15 min each)
-run l2-p32-del0             "$N" "$BLOCKS" 0  4294967296 64  0
-run l2-p32-del30            "$N" "$BLOCKS" 30 4294967296 64  0
+run l2-p32-del0            swiss "$N" "$BLOCKS" 0  4294967296 64  0
+run l2-p32-del30           swiss "$N" "$BLOCKS" 30 4294967296 64  0
 
 echo "==> results"
 mkdir -p "$REPO/results"

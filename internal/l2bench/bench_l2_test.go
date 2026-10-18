@@ -211,12 +211,14 @@ type l2Result struct {
 	AddsPerBlock  int     `json:"adds_per_block"`
 	DelPct        int     `json:"del_pct"`
 	Presize       uint64  `json:"presize"`
+	Impl          string  `json:"impl"`
 	CacheMB       uint64  `json:"cache_mb"`
 	Reopen        bool    `json:"reopen"`
 	Leaves        uint64  `json:"leaves"`
 	Adds          uint64  `json:"adds"`
 	Dels          uint64  `json:"dels"`
 	Errors        uint64  `json:"errors"`
+	FirstErr      string  `json:"first_err"`
 	SetupSeconds  float64 `json:"setup_seconds"`
 	TotalSeconds  float64 `json:"total_seconds"`
 	BlocksPerSec  float64 `json:"blocks_per_sec"`
@@ -244,6 +246,7 @@ func BenchmarkL2Forest(b *testing.B) {
 	nBlocks := int(l2EnvU64("BENCH_L2_BLOCKS", 10_000))
 	delPct := int(l2EnvU64("BENCH_L2_DEL_PCT", 0))
 	presize := l2EnvU64("BENCH_L2_PRESIZE", 2*n)
+	impl := l2EnvStr("BENCH_L2_IMPL", "swiss")
 	cacheMB := l2EnvU64("BENCH_L2_CACHE_MB", 64)
 	seed := l2EnvU64("BENCH_L2_SEED", 0xC0C0_1234)
 	dir := l2EnvStr("BENCH_L2_DIR", "")
@@ -268,6 +271,7 @@ func BenchmarkL2Forest(b *testing.B) {
 	opts := []utreexo.ForestOption{
 		utreexo.ExpectedMaxLeaves(presize),
 		utreexo.MaxCacheMemory(int64(cacheMB) << 20),
+		utreexo.PositionMapKind(impl),
 	}
 
 	before := l2ReadCounters()
@@ -282,6 +286,7 @@ func BenchmarkL2Forest(b *testing.B) {
 	addsBuf := make([]utreexo.Leaf, tr.addsPer)
 	delsBuf := make([]utreexo.Hash, 0, 1024)
 	var adds, dels, errs uint64
+	firstErr := ""
 
 	before = l2ReadCounters()
 	t0 := time.Now()
@@ -297,6 +302,9 @@ func BenchmarkL2Forest(b *testing.B) {
 		t := time.Now()
 		if _, err := f.ModifyAndReturnTTLs(addsBuf, delsBuf, utreexo.Proof{}); err != nil {
 			errs++
+			if firstErr == "" {
+				firstErr = fmt.Sprintf("block %d: %v", bi, err)
+			}
 		}
 		blockDurs[bi] = time.Since(t).Nanoseconds()
 		adds += uint64(len(addsBuf))
@@ -342,12 +350,14 @@ func BenchmarkL2Forest(b *testing.B) {
 		AddsPerBlock:  tr.addsPer,
 		DelPct:        delPct,
 		Presize:       presize,
+		Impl:          impl,
 		CacheMB:       cacheMB,
 		Reopen:        reopen,
 		Leaves:        leaves,
 		Adds:          adds,
 		Dels:          dels,
 		Errors:        errs,
+		FirstErr:      firstErr,
 		SetupSeconds:  setupDur.Seconds(),
 		TotalSeconds:  secs,
 		BlocksPerSec:  float64(nBlocks) / secs,

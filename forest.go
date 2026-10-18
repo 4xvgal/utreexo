@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/utreexo/utreexo/internal/mmapfile"
-	"github.com/utreexo/utreexo/internal/swisstable"
 	"golang.org/x/exp/slices"
 )
 
@@ -277,7 +276,7 @@ type Forest struct {
 	// Upper 17 bits = addIndex (index within Modify batch), lower 47 bits = position.
 	// Only tracks leaves (row 0), not intermediate nodes.
 	// Uses Swiss Table with mmap'd files for memory efficiency.
-	positionMap *swisstable.SwissPositionMap
+	positionMap PositionMap
 
 	// deletedLeafPositions tracks which leaf positions have been deleted.
 	// Persisted via the WAL (dirty words are serialized during flush).
@@ -364,6 +363,10 @@ func readBlockCounts(file io.ReaderAt, size int64) ([]uint32, error) {
 // posMapCtrlPath and posMapSlotsPath are file paths for the Swiss Table position map.
 // forestRows sets the maximum tree height (determines max leaves = 2^forestRows).
 func newForest(file, blockCountsFile, metaFile *cachedRWS, bitmap *deletedBitmap, posMapCtrlPath, posMapSlotsPath string, forestRows uint8, expectedMaxLeaves uint64) (*Forest, error) {
+	return newForestWithPosmap(file, blockCountsFile, metaFile, bitmap, posMapCtrlPath, posMapSlotsPath, forestRows, expectedMaxLeaves, "swiss")
+}
+
+func newForestWithPosmap(file, blockCountsFile, metaFile *cachedRWS, bitmap *deletedBitmap, posMapCtrlPath, posMapSlotsPath string, forestRows uint8, expectedMaxLeaves uint64, posmapKind string) (*Forest, error) {
 	if file == nil || blockCountsFile == nil || metaFile == nil {
 		return nil, fmt.Errorf("one of the given files are nil")
 	}
@@ -420,7 +423,7 @@ func newForest(file, blockCountsFile, metaFile *cachedRWS, bitmap *deletedBitmap
 	if expectedMaxLeaves == 0 {
 		expectedEntries = max(expectedEntries, 1<<16)
 	}
-	posMap, needsRebuild, err := swisstable.NewSwissPositionMap(posMapCtrlPath, posMapSlotsPath, expectedEntries, consistencyHash, file, positionMask)
+	posMap, needsRebuild, err := newPositionMap(posmapKind, posMapCtrlPath, posMapSlotsPath, expectedEntries, consistencyHash, file, positionMask)
 	if err != nil {
 		return nil, fmt.Errorf("create position map: %w", err)
 	}
@@ -448,6 +451,16 @@ type ForestOption func(*forestOptions)
 type forestOptions struct {
 	maxCacheMemory    int64
 	expectedMaxLeaves uint64
+	posmapKind        string
+}
+
+// PositionMapKind selects the position-map implementation used by the Forest.
+// "swiss" (default) uses the production Swiss Table; "lh" uses the alternative
+// linear-hashing map (bench/l2-forest).
+func PositionMapKind(kind string) ForestOption {
+	return func(o *forestOptions) {
+		o.posmapKind = kind
+	}
 }
 
 // MaxCacheMemory sets the total WAL cache memory budget in bytes.
@@ -562,12 +575,13 @@ func OpenForest(dbpath string, opts ...ForestOption) (*Forest, error) {
 	ctrlPath := filepath.Join(dbpath, forestPosMapCtrlFileName)
 	slotsPath := filepath.Join(dbpath, forestPosMapSlotsFileName)
 
-	f, err := newForest(
+	f, err := newForestWithPosmap(
 		wal.Cached(0), wal.Cached(1), wal.Cached(2),
 		wal.Bitmap(),
 		ctrlPath, slotsPath,
 		defaultForestRows,
 		o.expectedMaxLeaves,
+		o.posmapKind,
 	)
 	if err != nil {
 		for _, c := range closers {
