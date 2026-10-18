@@ -12,28 +12,29 @@ import (
 	"github.com/utreexo/utreexo/internal/swisstable"
 )
 
-// Linear hashing position map, v2 (key-prefix embedded).
+// Linear hashing position map, v3 (key-prefix embedded).
 //
 // The table lives in one mmap'd file: a 64-byte header followed by fixed-size
-// buckets. Each entry stores the packed value plus a 16-byte prefix of the key,
+// buckets. Each entry stores the packed value plus a 12-byte prefix of the key,
 // so the map confirms a hit by itself and never reads the data file. This
 // removes verifyHash (a random forest_data read per lookup), at the cost of
-// ~36 bytes/entry instead of ~13.
+// 20 bytes/entry instead of ~13.
 //
 // The prefix also lets split() re-place entries using the stored key bytes, so
-// the data file is not touched during growth either. A 16-byte prefix is
-// required: 8 bytes would collide ~16 times at 2^34 live entries, 16 bytes
-// gives a 2^-60 table-wide collision probability.
+// the data file is not touched during growth either. A 12-byte (96-bit) prefix
+// is enough: 8 bytes would collide ~16 times at 2^34 live entries, while 96
+// bits keeps the table-wide collision expectation at 2^-17 for 2^40 live
+// entries and 2^-33 for the 2^31.5 of the assume-utreexod set.
 //
-// Growth is incremental: when the global load exceeds 0.5, one bucket is split
+// Growth is incremental: when the global load exceeds 0.4, one bucket is split
 // into two. There is no O(N) rehash and no presize cliff. Bucket capacity 128
-// at load 0.5 makes per-bucket overflow statistically impossible.
+// at load 0.4 leaves headroom for the 2x key-inflow bias of unsplit buckets.
 //
 // This is a bench/l2-forest addition; it does not replace the production map.
 
 const (
 	lhBucketSlots  = 128
-	lhKeyPrefixLen = 16
+	lhKeyPrefixLen = 12
 	lhSlotSize     = 8 + lhKeyPrefixLen // packed value + key prefix
 	lhHeaderSize   = 64
 	lhBucketSize   = lhBucketSlots + lhBucketSlots*lhSlotSize
@@ -45,9 +46,10 @@ const (
 	lhOffHash  = 32
 )
 
-// lhMagic is bumped from "LH1" because the on-disk slot layout changed; an
-// existing v1 file fails the magic check and is rebuilt from the data file.
-var lhMagic = [8]byte{'L', 'H', '2'}
+// lhMagic is bumped from "LH2" because the on-disk slot layout changed (16B to
+// 12B key prefix); an existing v2 file fails the magic check and is rebuilt
+// from the data file.
+var lhMagic = [8]byte{'L', 'H', '3'}
 
 var lhZeroPrefix [lhKeyPrefixLen]byte
 
@@ -91,7 +93,7 @@ type lhPositionMap struct {
 }
 
 // newLHPositionMap keeps the shared factory signature. dataFile and posMask
-// are unused in v2: keys are confirmed by the embedded prefix, so neither the
+// are unused in v3: keys are confirmed by the embedded prefix, so neither the
 // forest data file nor a position mask is needed.
 func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [32]byte, _ swisstable.HashSource, _ uint64) (PositionMap, bool, error) {
 	f, err := os.OpenFile(ctrlPath, os.O_RDWR|os.O_CREATE, 0o644)
@@ -134,7 +136,7 @@ func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [
 			need = expectedEntries*2/lhBucketSlots + 1
 		}
 		maxB := uint64(2)
-		for maxB < need*2 {
+		for maxB < need {
 			maxB <<= 1
 		}
 		m.buckets = maxB
@@ -186,7 +188,7 @@ func (m *lhPositionMap) ctrl(b uint64) []byte {
 }
 
 // slot returns the packed value (first 8 bytes) and the stored key prefix
-// (next 16 bytes) of slot i in bucket b.
+// (next 12 bytes) of slot i in bucket b.
 func (m *lhPositionMap) slot(b, i uint64) (uint64, []byte) {
 	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots + int(i)*lhSlotSize
 	return binary.LittleEndian.Uint64(m.mmap[o:]), m.mmap[o+8 : o+8+lhKeyPrefixLen]
@@ -226,9 +228,9 @@ func (m *lhPositionMap) Set(hash [32]byte, packed uint64) error {
 	return m.insert(hash, packed)
 }
 
-// growFor splits until count+add fits at load <= 0.5.
+// growFor splits until count+add fits at load <= 0.4.
 func (m *lhPositionMap) growFor(add uint64) error {
-	for (m.count+add)*2 > m.numBuckets()*lhBucketSlots {
+	for (m.count+add)*5 > m.numBuckets()*lhBucketSlots*2 {
 		m.splitsLoad++
 		if err := m.split(); err != nil {
 			return err
