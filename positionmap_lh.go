@@ -76,6 +76,18 @@ type lhPositionMap struct {
 	splitAt uint64
 	count   uint64
 	buckets uint64 // allocated capacity
+
+	// Measurement only, enabled by UTREEXOD_POSMAP_STATS. Counters are
+	// process-lifetime (not persisted); a reused table starts with
+	// tombSlots=0, so absolute tombstone numbers are only exact on a fresh
+	// build, which is what the measurement runs use.
+	statsOn    bool
+	statEvery  uint64
+	ops        uint64
+	splitsLoad uint64 // splits triggered by the global load threshold
+	splitsFull uint64 // splits triggered because a bucket was full (tombstones)
+	placeFull  uint64 // place() could not fit during a split (should stay 0)
+	tombSlots  uint64 // deleted control bytes across the table
 }
 
 // newLHPositionMap keeps the shared factory signature. dataFile and posMask
@@ -104,7 +116,7 @@ func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [
 		}
 	}
 
-	m := &lhPositionMap{file: f}
+	m := &lhPositionMap{file: f, statsOn: os.Getenv("UTREEXOD_POSMAP_STATS") != "", statEvery: 1 << 22}
 
 	if reuse {
 		var hdr [lhHeaderSize]byte
@@ -150,6 +162,10 @@ func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [
 		return nil, false, err
 	}
 	m.mmap = mm
+	if m.statsOn {
+		fmt.Fprintf(os.Stderr, "LH_STATS open reuse=%v count=%d tomb=unknown numBuckets=%d capBuckets=%d expectedEntries=%d\n",
+			reuse, m.count, m.numBuckets(), m.buckets, expectedEntries)
+	}
 	return m, !reuse, nil
 }
 
@@ -213,6 +229,7 @@ func (m *lhPositionMap) Set(hash [32]byte, packed uint64) error {
 // growFor splits until count+add fits at load <= 0.5.
 func (m *lhPositionMap) growFor(add uint64) error {
 	for (m.count+add)*2 > m.numBuckets()*lhBucketSlots {
+		m.splitsLoad++
 		if err := m.split(); err != nil {
 			return err
 		}
@@ -222,6 +239,7 @@ func (m *lhPositionMap) growFor(add uint64) error {
 
 // insert places hash without growing.
 func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
+	m.bumpStats()
 	h1, h2 := swissSplitHash(hash)
 	prefix := hash[:lhKeyPrefixLen]
 	for {
@@ -237,13 +255,17 @@ func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
 		}
 		for i := 0; i < lhBucketSlots; i++ {
 			if ctrl[i] == ctrlEmptyByte || ctrl[i] == ctrlDeletedByte {
+				if ctrl[i] == ctrlDeletedByte {
+					m.tombSlots--
+				}
 				ctrl[i] = h2
 				m.setSlot(b, uint64(i), packed, prefix)
 				m.count++
 				return nil
 			}
 		}
-		// Statistically unreachable at load 0.5 with 128 slots, but recover.
+		// Bucket full although the global load is low: tombstone pressure.
+		m.splitsFull++
 		if err := m.split(); err != nil {
 			return err
 		}
@@ -260,6 +282,7 @@ func (m *lhPositionMap) place(b uint64, h2 byte, packed uint64, prefix []byte) e
 			return nil
 		}
 	}
+	m.placeFull++
 	return fmt.Errorf("lh place: bucket %d full", b)
 }
 
@@ -310,6 +333,7 @@ func (m *lhPositionMap) split() error {
 		prefix     [lhKeyPrefixLen]byte
 	}
 	ents := make([]entry, 0, lhBucketSlots)
+	tomb := uint64(0)
 	for i := 0; i < lhBucketSlots; i++ {
 		if ctrl[i]&ctrlFullByte != 0 {
 			p, prefix := m.slot(oldB, uint64(i))
@@ -320,7 +344,14 @@ func (m *lhPositionMap) split() error {
 			// so the data file is never consulted here.
 			e.h1 = binary.LittleEndian.Uint64(e.prefix[:8])
 			ents = append(ents, e)
+		} else if ctrl[i] == ctrlDeletedByte {
+			tomb++
 		}
+	}
+	if tomb >= m.tombSlots {
+		m.tombSlots = 0
+	} else {
+		m.tombSlots -= tomb
 	}
 	m.clearBucket(oldB)
 	for _, e := range ents {
@@ -349,6 +380,7 @@ func (m *lhPositionMap) Get(hash [32]byte) (uint64, bool, error) {
 }
 
 func (m *lhPositionMap) Delete(hash [32]byte) (bool, error) {
+	m.bumpStats()
 	h1, h2 := swissSplitHash(hash)
 	prefix := hash[:lhKeyPrefixLen]
 	b := m.bucketFor(h1)
@@ -360,6 +392,7 @@ func (m *lhPositionMap) Delete(hash [32]byte) (bool, error) {
 				ctrl[i] = ctrlDeletedByte
 				m.setSlot(b, uint64(i), 0, lhZeroPrefix[:])
 				m.count--
+				m.tombSlots++
 				return true, nil
 			}
 		}
@@ -368,6 +401,35 @@ func (m *lhPositionMap) Delete(hash [32]byte) (bool, error) {
 }
 
 func (m *lhPositionMap) Count() uint64 { return m.count }
+
+func (m *lhPositionMap) bumpStats() {
+	if !m.statsOn {
+		return
+	}
+	m.ops++
+	if m.ops%m.statEvery == 0 {
+		m.logStats("periodic")
+	}
+}
+
+func (m *lhPositionMap) logStats(tag string) {
+	if !m.statsOn {
+		return
+	}
+	slots := m.numBuckets() * lhBucketSlots
+	load, usedRatio, tombRatio := 0.0, 0.0, 0.0
+	if slots > 0 {
+		load = float64(m.count) / float64(slots)
+		usedRatio = float64(m.count+m.tombSlots) / float64(slots)
+	}
+	if used := m.count + m.tombSlots; used > 0 {
+		tombRatio = float64(m.tombSlots) / float64(used)
+	}
+	fmt.Fprintf(os.Stderr,
+		"LH_STATS %s ops=%d count=%d tomb=%d numBuckets=%d capBuckets=%d load=%.4f usedRatio=%.4f tombRatio=%.4f splitsLoad=%d splitsFull=%d placeFull=%d\n",
+		tag, m.ops, m.count, m.tombSlots, m.numBuckets(), m.buckets, load, usedRatio, tombRatio,
+		m.splitsLoad, m.splitsFull, m.placeFull)
+}
 
 func (m *lhPositionMap) ForEach(fn func(packed uint64)) {
 	for b := uint64(0); b < m.numBuckets(); b++ {
@@ -409,6 +471,9 @@ func (b *lhBatch) Insert(h [32]byte, p uint64) error { return b.m.insert(h, p) }
 
 func (m *lhPositionMap) Close() error {
 	m.syncHeader()
+	if m.statsOn {
+		m.logStats("close")
+	}
 	err := syscall.Munmap(m.mmap)
 	if e := m.file.Close(); err == nil {
 		err = e
