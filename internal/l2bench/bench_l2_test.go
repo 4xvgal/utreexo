@@ -300,7 +300,7 @@ func BenchmarkL2Forest(b *testing.B) {
 			delsBuf = append(delsBuf, tr.hashes[idx])
 		}
 		t := time.Now()
-		if _, err := f.ModifyAndReturnTTLs(addsBuf, delsBuf, utreexo.Proof{}); err != nil {
+		if _, _, err := f.ModifyAndReturnTTLs(addsBuf, delsBuf, utreexo.Proof{}); err != nil {
 			errs++
 			if firstErr == "" {
 				firstErr = fmt.Sprintf("block %d: %v", bi, err)
