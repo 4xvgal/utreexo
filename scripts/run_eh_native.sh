@@ -71,7 +71,7 @@ wall() { # label n impl mem [extra env...]
   local extra="$*"
   echo "==> WALL $label (N=$n impl=$impl mem=$mem $extra)"
   limactl shell "$VM" -- bash -c "
-    sudo systemctl reset-failed ehbench 2>/dev/null || true; sudo rm -rf $BENCH/data/$label; sync; sleep 10
+    sudo systemctl stop ehwall 2>/dev/null || true; sudo systemctl reset-failed ehwall 2>/dev/null || true; sudo rm -rf $BENCH/data/$label; sync; sleep 10
     sudo systemd-run --unit=ehwall --wait --pipe --collect \
       --property=MemoryMax=$mem --property=MemorySwapMax=0 \
       --property=RuntimeMaxSec=${WALL_TIMEOUT:-900} \
@@ -113,6 +113,20 @@ p1rest)
   run "swiss-p16x-1000000" 1000000 swiss 16777216 add 2G || true
   run "swiss-p128x-1000000" 1000000 swiss 134217728 add 2G || true
   ;;
+p1lh51)
+  NS=${NS:-"1000000 4000000 16000000"}
+  for n in $NS; do
+    run "lh51-$n" "$n" lh51 "$((2*n))" add 3G
+  done
+  ;;
+p2lh51)
+  P2N=${P2N:-"8000000 16000000"}
+  for n in $P2N; do
+    for rep in 1 2 3; do
+      wall "lh51-512m-$n-r$rep" "$n" lh51 512M
+    done
+  done
+  ;;
 p1b)
   for n in 4000000 16000000; do
     for mix in 2:1 1:1; do
@@ -124,7 +138,8 @@ p1b)
 p2|p2a|p2b)
   if [ "$PHASE" = p2a ]; then P2N="8000000"; fi
   if [ "$PHASE" = p2b ]; then P2N="16000000"; fi
-  for n in ${P2N:-"8000000 16000000"}; do
+  P2N=${P2N:-"8000000 16000000"}
+  for n in $P2N; do
     for rep in 1 2 3; do
       for spec in "lh:3G:" "eh04:3G:EH_LOAD=0.40" "eh08:3G:EH_LOAD=0.80" "eh09:3G:EH_LOAD=0.90"; do
         impl=${spec%%:*}; rest=${spec#*:}; mem=${rest%%:*}; extra=${rest#*:}

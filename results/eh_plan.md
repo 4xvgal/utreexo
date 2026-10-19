@@ -46,3 +46,9 @@
   - 기존 하니스는 keys(N*32B)+ops trace가 캡에 안 들어가므로 스트리밍 `BenchmarkL1Wall` 사용.
   - 지시문의 MEM=2G·N=32M은 map이 캡의 절반 이하라 벽이 아니어서 512M·16M로 대체.
   - swiss 2^32(55GB)는 실행하지 않고 기존 failpoint 실측을 인용.
+
+## 추가: production LH v5.1 동일 하니스 비교 (5.1 vs EH)
+- package 순환 때문에 production `lhPositionMap`을 swisstable test로 직접 link할 수 없어,
+  v5.1 알고리즘을 `lh51`로 bench 파일에 포트(2688B bucket, 20B slot, load 0.4, prefix,
+  pwrite, pow2 doubling). 목적: 슬롯 폭·write path를 EH와 동일하게 맞춰 주소지정/load 격리.
+- `BENCH_IMPL=lh51`, phases: `p1lh51`(hot), `p2lh51`(512M wall).

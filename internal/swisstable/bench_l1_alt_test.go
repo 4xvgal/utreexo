@@ -54,6 +54,8 @@ func l1NewImpl(impl, dir string, expectedEntries uint64, src HashSource, posMask
 		return l1NewLH(dir, expectedEntries, src, posMask)
 	case "eh", "eh8":
 		return l1NewEH(dir, expectedEntries, src, posMask)
+	case "lh51":
+		return l1NewLH51Impl(dir, expectedEntries)
 	case "bbolt":
 		return l1NewBbolt(dir)
 	default:

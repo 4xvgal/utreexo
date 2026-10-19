@@ -12,6 +12,8 @@
 package swisstable
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -138,6 +140,319 @@ func l1NewEH(dir string, expectedEntries uint64, src HashSource, posMask uint64)
 // array nor the op trace. data.dat is written once (streamed) for the impls
 // that use verifyHash, and reused across runs via BENCH_DATA.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// lh51: production linear hashing v5.1 (positionmap_lh.go) ported into the
+// test package. The real type lives in package utreexo, which imports
+// internal/swisstable, so it cannot be linked here directly; this is a
+// faithful copy of the v5.1 constants and flow: 2688 B buckets, 20 B
+// (packed+12 B prefix) slots, load 0.4 growth, prefix-only lookups, pwrite
+// mutations over a read-only mmap, power-of-two bucket doubling.
+//
+// Purpose: compare EH against LH under identical slot width and write path,
+// so the address scheme and presize policy are the only differences.
+// ---------------------------------------------------------------------------
+
+const (
+	lh51BucketSlots = 128
+	lh51PrefixLen   = 12
+	lh51SlotSize    = 8 + lh51PrefixLen
+	lh51HeaderSize  = 64
+	lh51BucketSize  = lh51BucketSlots + lh51BucketSlots*lh51SlotSize
+	lh51CtrlDeleted = 0x7F
+)
+
+type l1LH51Map struct {
+	mmap      []byte
+	file      *os.File
+	level     uint64
+	splitAt   uint64
+	count     uint64
+	buckets   uint64
+	tomb      uint64
+	placeFull uint64
+}
+
+func l1NewLH51(dir string, expectedEntries uint64) (*l1LH51Map, error) {
+	need := uint64(1)
+	if expectedEntries > 0 {
+		need = expectedEntries*2/lh51BucketSlots + 1
+	}
+	maxB := uint64(2)
+	for maxB < need {
+		maxB <<= 1
+	}
+	size := int64(lh51HeaderSize + maxB*lh51BucketSize)
+	f, err := os.OpenFile(filepath.Join(dir, "lh51.dat"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		return nil, err
+	}
+	mm, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &l1LH51Map{mmap: mm, file: f, buckets: maxB}, nil
+}
+
+func (m *l1LH51Map) numBuckets() uint64 { return (uint64(1) << m.level) + m.splitAt }
+
+func (m *l1LH51Map) bucketFor(h1 uint64) uint64 {
+	base := uint64(1) << m.level
+	b := h1 % (base << 1)
+	if b >= base+m.splitAt {
+		b = h1 % base
+	}
+	return b
+}
+
+func (m *l1LH51Map) ctrl(b uint64) []byte {
+	o := lh51HeaderSize + int(b)*lh51BucketSize
+	return m.mmap[o : o+lh51BucketSlots]
+}
+
+func (m *l1LH51Map) slotOff(b, i uint64) int64 {
+	return int64(lh51HeaderSize+int(b)*lh51BucketSize+lh51BucketSlots) + int64(i)*lh51SlotSize
+}
+
+func (m *l1LH51Map) slot(b, i uint64) (uint64, []byte) {
+	o := m.slotOff(b, i)
+	return binary.LittleEndian.Uint64(m.mmap[o:]), m.mmap[o+8 : o+8+lh51PrefixLen]
+}
+
+func (m *l1LH51Map) writeAt(off int64, p []byte) error {
+	_, err := m.file.WriteAt(p, off)
+	return err
+}
+
+func (m *l1LH51Map) setCtrl(b, i uint64, v byte) error {
+	return m.writeAt(int64(lh51HeaderSize+int(b)*lh51BucketSize)+int64(i), []byte{v})
+}
+
+func (m *l1LH51Map) setSlot(b, i, packed uint64, prefix []byte) error {
+	var buf [lh51SlotSize]byte
+	binary.LittleEndian.PutUint64(buf[:], packed)
+	copy(buf[8:], prefix)
+	return m.writeAt(m.slotOff(b, i), buf[:])
+}
+
+func (m *l1LH51Map) clearBucket(b uint64) error {
+	return m.writeAt(int64(lh51HeaderSize+int(b)*lh51BucketSize), make([]byte, lh51BucketSize))
+}
+
+func (m *l1LH51Map) ensureBuckets(idx uint64) error {
+	if idx < m.buckets {
+		return nil
+	}
+	newB := m.buckets
+	for newB <= idx {
+		newB <<= 1
+	}
+	newSize := int64(lh51HeaderSize + newB*lh51BucketSize)
+	if err := syscall.Munmap(m.mmap); err != nil {
+		return err
+	}
+	m.mmap = nil
+	if err := m.file.Truncate(newSize); err != nil {
+		return err
+	}
+	mm, err := syscall.Mmap(int(m.file.Fd()), 0, int(newSize), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	m.mmap = mm
+	m.buckets = newB
+	return nil
+}
+
+func (m *l1LH51Map) growFor(add uint64) error {
+	for (m.count+add)*5 > m.numBuckets()*lh51BucketSlots*2 {
+		if err := m.split(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *l1LH51Map) Set(hash [32]byte, packed uint64) error {
+	if err := m.growFor(1); err != nil {
+		return err
+	}
+	h1 := binary.LittleEndian.Uint64(hash[:8])
+	h2 := (hash[8] & 0x7F) | 0x80
+	prefix := hash[:lh51PrefixLen]
+	for {
+		b := m.bucketFor(h1)
+		ctrl := m.ctrl(b)
+		for i := 0; i < lh51BucketSlots; i++ {
+			if ctrl[i] == h2 {
+				if _, p := m.slot(b, uint64(i)); bytes.Equal(p, prefix) {
+					return m.setSlot(b, uint64(i), packed, prefix)
+				}
+			}
+		}
+		for i := 0; i < lh51BucketSlots; i++ {
+			if ctrl[i] == 0 || ctrl[i] == lh51CtrlDeleted {
+				if ctrl[i] == lh51CtrlDeleted {
+					m.tomb--
+				}
+				if err := m.setCtrl(b, uint64(i), h2); err != nil {
+					return err
+				}
+				if err := m.setSlot(b, uint64(i), packed, prefix); err != nil {
+					return err
+				}
+				m.count++
+				return nil
+			}
+		}
+		if err := m.split(); err != nil {
+			return err
+		}
+	}
+}
+
+type lh51Ent struct {
+	h1, packed uint64
+	pfx        [lh51PrefixLen]byte
+}
+
+func (m *l1LH51Map) place(b uint64, h2 byte, packed uint64, pfx []byte) error {
+	ctrl := m.ctrl(b)
+	for i := 0; i < lh51BucketSlots; i++ {
+		if ctrl[i] == 0 || ctrl[i] == lh51CtrlDeleted {
+			if err := m.setCtrl(b, uint64(i), h2); err != nil {
+				return err
+			}
+			return m.setSlot(b, uint64(i), packed, pfx)
+		}
+	}
+	m.placeFull++
+	return fmt.Errorf("lh51 place: bucket %d full", b)
+}
+
+func (m *l1LH51Map) split() error {
+	oldB := m.splitAt
+	newB := (uint64(1) << m.level) + m.splitAt
+	if err := m.ensureBuckets(newB); err != nil {
+		return err
+	}
+	if err := m.clearBucket(newB); err != nil {
+		return err
+	}
+	m.splitAt++
+	if m.splitAt == (uint64(1) << m.level) {
+		m.level++
+		m.splitAt = 0
+	}
+	ents := make([]lh51Ent, 0, lh51BucketSlots)
+	ctrl := m.ctrl(oldB)
+	for i := 0; i < lh51BucketSlots; i++ {
+		if ctrl[i]&0x80 != 0 {
+			p, pfx := m.slot(oldB, uint64(i))
+			e := lh51Ent{packed: p}
+			copy(e.pfx[:], pfx)
+			e.h1 = binary.LittleEndian.Uint64(e.pfx[:8])
+			ents = append(ents, e)
+		} else if ctrl[i] == lh51CtrlDeleted {
+			if m.tomb > 0 {
+				m.tomb--
+			}
+		}
+	}
+	if err := m.clearBucket(oldB); err != nil {
+		return err
+	}
+	for _, e := range ents {
+		h2 := (e.pfx[8] & 0x7F) | 0x80
+		if err := m.place(m.bucketFor(e.h1), h2, e.packed, e.pfx[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *l1LH51Map) Get(hash [32]byte) (uint64, bool, error) {
+	h1 := binary.LittleEndian.Uint64(hash[:8])
+	h2 := (hash[8] & 0x7F) | 0x80
+	prefix := hash[:lh51PrefixLen]
+	b := m.bucketFor(h1)
+	ctrl := m.ctrl(b)
+	for i := 0; i < lh51BucketSlots; i++ {
+		if ctrl[i] == h2 {
+			p, stored := m.slot(b, uint64(i))
+			if bytes.Equal(stored, prefix) {
+				return p, true, nil
+			}
+		}
+	}
+	return 0, false, nil
+}
+
+func (m *l1LH51Map) Delete(hash [32]byte) (bool, error) {
+	h1 := binary.LittleEndian.Uint64(hash[:8])
+	h2 := (hash[8] & 0x7F) | 0x80
+	prefix := hash[:lh51PrefixLen]
+	b := m.bucketFor(h1)
+	ctrl := m.ctrl(b)
+	for i := 0; i < lh51BucketSlots; i++ {
+		if ctrl[i] == h2 {
+			_, stored := m.slot(b, uint64(i))
+			if bytes.Equal(stored, prefix) {
+				if err := m.setCtrl(b, uint64(i), lh51CtrlDeleted); err != nil {
+					return false, err
+				}
+				if err := m.setSlot(b, uint64(i), 0, make([]byte, lh51PrefixLen)); err != nil {
+					return false, err
+				}
+				m.count--
+				m.tomb++
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (m *l1LH51Map) Count() uint64 { return m.count }
+
+func (m *l1LH51Map) ForEach(fn func(uint64)) {
+	for b := uint64(0); b < m.numBuckets(); b++ {
+		ctrl := m.ctrl(b)
+		for i := 0; i < lh51BucketSlots; i++ {
+			if ctrl[i]&0x80 != 0 {
+				p, _ := m.slot(b, uint64(i))
+				fn(p)
+			}
+		}
+	}
+}
+
+func (m *l1LH51Map) NumSlots() uint64 { return m.numBuckets() * lh51BucketSlots }
+func (m *l1LH51Map) MapBytes() uint64 { return uint64(len(m.mmap)) }
+func (m *l1LH51Map) DropCache()       { l1DropCache(m.file) }
+
+func (m *l1LH51Map) Ops() uint64 { return 0 }
+
+func (m *l1LH51Map) Close() error {
+	err := syscall.Munmap(m.mmap)
+	if e := m.file.Close(); err == nil {
+		err = e
+	}
+	return err
+}
+
+func l1NewLH51Impl(dir string, expectedEntries uint64) (l1Posmap, error) {
+	m, err := l1NewLH51(dir, expectedEntries)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
 
 type l1WallResult struct {
 	l1Result
