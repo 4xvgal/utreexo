@@ -4,9 +4,9 @@
 // + verifyHash + f.mu), driven through the public API. Lives in its own test
 // package so it links the production library, not the L1 test helpers.
 //
-//   go test -c -o /data/l2bench.test ./internal/l2bench
-//   BENCH_L2_DIR=/data/l2/run1 BENCH_L2_N=1680000 BENCH_L2_PRESIZE=4294967296 \
-//     /data/l2bench.test -test.run '^$' -test.bench '^BenchmarkL2Forest$' -test.benchtime 1x
+//	go test -c -o /data/l2bench.test ./internal/l2bench
+//	BENCH_L2_DIR=/data/l2/run1 BENCH_L2_N=1680000 BENCH_L2_PRESIZE=4294967296 \
+//	  /data/l2bench.test -test.run '^$' -test.bench '^BenchmarkL2Forest$' -test.benchtime 1x
 package l2bench
 
 import (
@@ -411,6 +411,12 @@ func l2PosmapFileSizes(dir string) (ctrl, slots uint64) {
 	} {
 		if fi, err := os.Stat(filepath.Join(dir, e.name)); err == nil {
 			*e.out = uint64(fi.Size())
+		}
+	}
+	// Extendible hashing uses its own two files; report their total in ctrl.
+	for _, n := range []string{"eh-ctrl.dat", "eh-dir.dat"} {
+		if fi, err := os.Stat(filepath.Join(dir, n)); err == nil {
+			ctrl += uint64(fi.Size())
 		}
 	}
 	return

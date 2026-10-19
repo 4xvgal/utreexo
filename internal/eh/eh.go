@@ -41,6 +41,7 @@ const (
 	bucketGrow  = 256  // buckets per bucket-file growth step (size slack)
 	depthGrow   = 4096 // bytes per local-depth array growth step
 	statDefault = 1 << 22
+	ehMaxDepth  = 48 // guard against degenerate key prefixes (see split)
 )
 
 // HashSource is the forest data file: HashAt(pos*32) returns the 32-byte key.
@@ -73,6 +74,7 @@ type EHMap struct {
 	src      HashSource
 	posMask  uint64
 	finished bool
+	consHash [32]byte
 
 	// counters, EH_STATS
 	ops        uint64
@@ -87,11 +89,20 @@ type EHMap struct {
 // (splitting itself only happens when a bucket is full); prefix selects the
 // 20 B (packed+prefix, no verifyHash) or 8 B (packed only, verifyHash) slot.
 func NewEHMap(dir string, load float64, prefix bool) (*EHMap, error) {
+	m, _, err := NewEHMapWithHash(dir, load, prefix, [32]byte{})
+	return m, err
+}
+
+// NewEHMapWithHash opens the map and reuses the on-disk table when its header
+// magic matches and the stored consistency hash is non-zero and equal. On
+// reuse the caller must not Presize again. reused=false means a fresh table
+// was created (the old files, if any, were truncated).
+func NewEHMapWithHash(dir string, load float64, prefix bool, consistencyHash [32]byte) (*EHMap, bool, error) {
 	if load <= 0 || load > 1 {
 		load = 0.80
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	m := &EHMap{
 		dirPath:   filepath.Join(dir, "eh-dir.dat"),
@@ -114,27 +125,106 @@ func NewEHMap(dir string, load float64, prefix bool) (*EHMap, error) {
 	if os.Getenv("EH_STATS") == "0" {
 		m.statOn = false
 	}
-	f, err := os.OpenFile(m.ctrlPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	cf, err := os.OpenFile(m.ctrlPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	m.ctrlFile = f
-	f, err = os.OpenFile(m.dirPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	df, err := os.OpenFile(m.dirPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		m.ctrlFile.Close()
-		return nil, err
+		cf.Close()
+		return nil, false, err
 	}
-	m.dirFile = f
-	// Minimal table: one bucket, one directory slot.
+	m.ctrlFile, m.dirFile = cf, df
+
+	// Reuse path: header magic present and consistency hash matches.
+	if fi, err := df.Stat(); err == nil && fi.Size() >= HeaderSize {
+		var h [HeaderSize]byte
+		if _, err := df.ReadAt(h[:], 0); err == nil && string(h[0:4]) == "EH01" {
+			var stored [32]byte
+			copy(stored[:], h[32:64])
+			if consistencyHash != ([32]byte{}) && stored == consistencyHash {
+				m.depth = binary.LittleEndian.Uint64(h[8:])
+				m.bucketCount = binary.LittleEndian.Uint64(h[16:])
+				m.count = binary.LittleEndian.Uint64(h[24:])
+				m.consHash = consistencyHash
+				m.dirSlots = uint64(1) << m.depth
+				if err := m.mapExisting(); err != nil {
+					m.Close()
+					return nil, false, err
+				}
+				return m, true, nil
+			}
+		}
+	}
+
+	// Fresh path.
+	if err := cf.Truncate(0); err != nil {
+		m.Close()
+		return nil, false, err
+	}
+	if err := df.Truncate(0); err != nil {
+		m.Close()
+		return nil, false, err
+	}
 	if err := m.resize(1, 1, 0); err != nil {
 		m.Close()
-		return nil, err
+		return nil, false, err
 	}
 	m.depth = 0
 	m.dirSlots = 1
 	m.bucketCount = 1
 	m.writeHeader()
-	return m, nil
+	return m, false, nil
+}
+
+func (m *EHMap) mapExisting() error {
+	dfi, err := m.dirFile.Stat()
+	if err != nil {
+		return err
+	}
+	cfi, err := m.ctrlFile.Stat()
+	if err != nil {
+		return err
+	}
+	dirSize := dfi.Size()
+	base := int64(HeaderSize + m.dirSlots*8)
+	if dirSize < base {
+		return fmt.Errorf("eh: dir file too small (%d < %d)", dirSize, base)
+	}
+	m.depthCap = uint64(dirSize - base)
+	m.bucketCap = uint64(cfi.Size()) / m.bucketSize()
+	mm, err := syscall.Mmap(int(m.dirFile.Fd()), 0, int(dirSize), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	m.dirMM = mm
+	if cfi.Size() > 0 {
+		mm, err = syscall.Mmap(int(m.ctrlFile.Fd()), 0, int(cfi.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			return err
+		}
+		m.ctrlMM = mm
+	}
+	// tombstones are not persisted; recount them so stats and split's tomb
+	// bookkeeping start consistent after a reopen.
+	m.tomb = 0
+	for b := uint64(0); b < m.bucketCount; b++ {
+		c := m.ctrl(b)
+		for i := 0; i < SlotCount; i++ {
+			if c[i] == ctrlDeleted {
+				m.tomb++
+			}
+		}
+	}
+	return nil
+}
+
+// SetConsistencyHash persists the forest consistency hash so a later open can
+// reuse the on-disk table instead of rebuilding it.
+func (m *EHMap) SetConsistencyHash(h [32]byte) error {
+	m.consHash = h
+	_, err := m.dirFile.WriteAt(h[:], 32)
+	return err
 }
 
 // SetVerifySource supplies the data file used by the no-prefix variant.
@@ -355,6 +445,7 @@ func (m *EHMap) writeHeader() {
 	binary.LittleEndian.PutUint64(h[8:], m.depth)
 	binary.LittleEndian.PutUint64(h[16:], m.bucketCount)
 	binary.LittleEndian.PutUint64(h[24:], m.count)
+	copy(h[32:64], m.consHash[:])
 	m.dirFile.WriteAt(h[:], 0)
 }
 
@@ -417,7 +508,7 @@ func (m *EHMap) Set(hash [32]byte, packed uint64) error {
 		}
 		for i := 0; i < SlotCount; i++ {
 			if ctrl[i] == ctrlEmpty || ctrl[i] == ctrlDeleted {
-				if ctrl[i] == ctrlDeleted {
+				if ctrl[i] == ctrlDeleted && m.tomb > 0 {
 					m.tomb--
 				}
 				if err := m.setCtrl(b, uint64(i), h2); err != nil {
@@ -700,6 +791,9 @@ func (m *EHMap) split(b, h1 uint64) error {
 
 	doubled := false
 	if d == m.depth {
+		if m.depth >= ehMaxDepth {
+			return fmt.Errorf("eh: local depth %d exceeds %d (degenerate key distribution?)", m.depth, ehMaxDepth)
+		}
 		if err := m.doubleDir(); err != nil {
 			return err
 		}

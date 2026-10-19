@@ -4,12 +4,13 @@
 
 production LH v5.1과 **동일 조건(pwrite, 20B prefix slot)** 에서 EH(0.8)는 map이 **3.1× 작고**
 hot ops/s가 **1.45~1.71× 빠르며**, 512M·16M 메모리 벽에서 **3.9× 빠르다** →
-**EH는 LH v5.1을 대체할 수 있다.** 단 L2 end-to-end(P3)와 1:1 churn의 실제 forest 검증은 미실시.
+**EH는 LH v5.1을 대체할 수 있다.** L2 end-to-end(P3)에서도 errors 0, roots가 swiss와 일치했고,
+EH가 LH v5.1보다 1.21× 빠르고 posmap은 1.99× 작았다. 1:1 churn steady-state만 추가 검증 대상이다.
 
 ## (2) 자원 / 커밋 / VM
 
 - host worktree: `/Volumes/mx500/utreexo-lab/bench-eh` (branch `poc/eh-v1`, base `aad6c84`)
-- 결과 JSONL `commit` 필드: 각 run 직전 HEAD (P1/P1b/P2 = `a23c5f8`, lh51 추가 run = `a23c5f8+`)
+- 결과 JSONL `commit` 필드: 각 run 직전 HEAD (P1/P1b/P2 = `a23c5f8`, lh51 = `a23c5f8`, L2 = `05b4373`)
 - VM: `eh-bench`, vz, 4 vCPU, **4GiB RAM**, 60GiB disk, Ubuntu 24.04 arm64 (kernel 6.8), Go 1.25.14
 - cgroup: P1/P1b `MemoryMax=3G`, P2 `MemoryMax=512M`, 모두 `MemorySwapMax=0`.
 
@@ -109,6 +110,35 @@ lh51은 20B prefix·**pwrite**·load 0.4·pow2 presize. 그래서 EH 대비 순�
 
 - lh51은 12.6M ops부터 서서히 꺾여 88k까지 하락; EH08은 끝까지 326k, majflt 불변.
 
+### 6c. P3: L2 end-to-end (Forest + position map, N=1.68M, 10000 blocks, cap 2G)
+
+`internal/l2bench` + `PositionMapKind("eh")`, adds+deletes, reopen=1. **errors=0 전부.**
+
+| label | impl | del% | total (s) | blocks/s | posmap (MB) | reopen (s) |
+|---|---|---|---|---|---|---|
+| eh-del0 | eh | 0 | 2.06 | 4,864 | 88.64 | 0.01 |
+| eh-del30 | eh | 30 | 4.48 | 2,233 | 88.64 | 0.01 |
+| eh-del30-c512 | eh | 30 | 4.59 | 2,177 | 88.64 | 0.01 |
+| eh-del30-reb | eh | 30 | 4.63 | 2,161 | 88.64 | 1.11 (force rebuild) |
+| lh-del30 | lh | 30 | 5.41 | 1,848 | 176.16 | 0.00 |
+| swiss-del30 | swiss | 30 | 2.77 | 3,604 | 43.20 | 0.01 |
+
+- EH vs LH v5.1: end-to-end **1.21× 빠름**, posmap **1.99× 작음**, 정상 reopen은 0.01s(consistency hash 재사용).
+- swiss는 여전히 가장 빠르고 작다(8B slot, prefix 없음 → verifyHash data read). N이 작아 data가 캐시에 남는 구간.
+- 캡 512MB(del30-c512)에서도 EH는 88.64MB로 영향 없음(동일 시간).
+
+### 6d. regtest (real Forest)
+
+- `TestEHPositionMapMatchesSwiss` (`positionmap_eh_regtest_test.go`, linux):
+  동일 adds/delete 트레이스를 EH Forest와 Swiss Forest에 replay하고 매 block `GetRoots()`가 **완전 일치**,
+  close→reopen 후 한 block 더 replay해도 일치. **PASS (0.3s)**.
+- `go test ./...` 전체 (Linux guest, 4GiB): **전부 PASS** (root 31.6s, internal/eh 6.9s, swisstable 0.18s).
+- 발견/수정: forest 테스트의 sim-chain 해시는 entropy가 low byte에 몰려 MSB-index EH 디렉터리를
+  degenerate하게 만든다(같은 버킷 128개 → directory doubling 무한 → OOM). 실제 mainnet 키는 sha256으로
+  uniform하므로 regtest는 uniform splitmix 키를 사용하고, EH에 `ehMaxDepth=48` 가드를 추가해
+  degenerate 입력에서 OOM 대신 에러를 내도록 했다.
+- tombstone은 header에 저장되지 않으므로 reopen 시 버킷을 스캔해 재계산하도록 수정.
+
 ## (7) A1~A5 판정
 
 | # | 기준 | 결과 | 근거 |
@@ -126,7 +156,7 @@ lh51은 20B prefix·**pwrite**·load 0.4·pow2 presize. 그래서 EH 대비 순�
 - **lh51은 test package 포트**: production 타입은 package `utreexo`에 있어 `internal/swisstable`로
   import할 수 없다(순환). v5.1의 상수/흐름(2688B bucket, 20B slot, load 0.4, prefix lookup, pwrite,
   pow2 doubling)을 그대로 옮겼다. 리터럴 동일 타입은 아님.
-- **P3(L2 end-to-end) 미실행**: 실 Forest의 `ModifyAndReturnTTLs` 경로 미검증.
+- **P3(L2 end-to-end) 실행 완료** (6c/6d): errors 0, EH==swiss roots, reopen 재사용 동작.
 - **1:1 churn**: harness 특성상 live가 작아 EH presize 과대. steady-state presize/live 기준 재측정 필요.
 - **EH_LOAD 0.7/0.8/0.9 수렴**: presize `2^(D-1)` 규칙상 8M/16M에서 동일(eh09=eh08 확인). 0.4만 별도.
 - **EH(0.4) 16M @512M은 kill**: 샘플만 보존(요약행 없음).
@@ -141,13 +171,15 @@ git -C /Volumes/mx500/utreexo-lab/bench-l1 worktree add ../bench-eh -b poc/eh-v1
 limactl start --name=eh-bench --vm-type=vz --cpus=4 --memory=4 --disk=60 --tty=false template://ubuntu-24.04
 cd /Volumes/mx500/utreexo-lab/bench-eh
 bash scripts/run_eh_native.sh p0
+bash scripts/run_eh_l2.sh regtest    # forest regression + go test ./...
+bash scripts/run_eh_l2.sh p3         # L2 end-to-end matrix
 bash scripts/run_eh_native.sh p1
 bash scripts/run_eh_native.sh p1b
 bash scripts/run_eh_native.sh p1lh51      # production LH v5.1 포트, hot
 bash scripts/run_eh_native.sh p2a
 bash scripts/run_eh_native.sh p2b
 bash scripts/run_eh_native.sh p2lh51      # production LH v5.1 포트, 512M 벽
-# 결과: results/eh-l1.jsonl, results/eh-wall.jsonl, results/eh-samples-*.jsonl
+# 결과: results/eh-l1.jsonl, results/eh-wall.jsonl, results/eh-samples-*.jsonl, results/eh-l2.jsonl
 ```
 
 ## (10) 다른 에이전트와의 충돌 여부

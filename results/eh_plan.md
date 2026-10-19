@@ -52,3 +52,11 @@
   v5.1 알고리즘을 `lh51`로 bench 파일에 포트(2688B bucket, 20B slot, load 0.4, prefix,
   pwrite, pow2 doubling). 목적: 슬롯 폭·write path를 EH와 동일하게 맞춰 주소지정/load 격리.
 - `BENCH_IMPL=lh51`, phases: `p1lh51`(hot), `p2lh51`(512M wall).
+
+## 추가: P3 (L2 end-to-end) + regtest
+- `positionmap_eh.go`(root, linux): `PositionMapKind("eh")` 팩토리. 5.1/forest 로직은 수정하지 않고
+  switch에 case만 추가. EH 파일은 position-map 디렉터리 하위 `eh-*.dat`.
+- `internal/eh`에 reopen 지원(`NewEHMapWithHash`, header magic+consistencyHash 재사용),
+  `SetConsistencyHash`, tombstone 재계산, `ehMaxDepth=48` 가드 추가.
+- `positionmap_eh_regtest_test.go`: EH Forest vs Swiss Forest roots 일치(adds+deletes+reopen).
+- `scripts/run_eh_l2.sh`: p3 매트릭스(lh/swiss/eh, del 0/30, cap 2G/512M) + regtest(`go test ./...`).
