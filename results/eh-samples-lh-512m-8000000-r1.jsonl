@@ -1,0 +1,8 @@
+{"t":1.000962072,"elapsed_s":1.000962072,"ops":2729729,"ops_per_s":2727105.32832257,"rss_kb":386416,"map_bytes":301989952,"minflt":19180,"majflt":2,"read_bytes":4431872,"write_bytes":305135616}
+{"t":2.000777314,"elapsed_s":2.000777314,"ops":4604481,"ops_per_s":1875098.4394374734,"rss_kb":445232,"map_bytes":301989952,"minflt":80996,"majflt":22,"read_bytes":6189056,"write_bytes":554491904}
+{"t":3.00099133,"elapsed_s":3.00099133,"ops":5576969,"ops_per_s":972279.9165413815,"rss_kb":475536,"map_bytes":301989952,"minflt":421432,"majflt":133,"read_bytes":19091456,"write_bytes":1946607616}
+{"t":4.002845137,"elapsed_s":4.002845137,"ops":5954492,"ops_per_s":376824.4402149584,"rss_kb":487176,"map_bytes":301989952,"minflt":703027,"majflt":243,"read_bytes":31154176,"write_bytes":2938974208}
+{"t":5.00057467,"elapsed_s":5.00057467,"ops":6597238,"ops_per_s":644208.6544911365,"rss_kb":507356,"map_bytes":301989952,"minflt":1158800,"majflt":445,"read_bytes":51769344,"write_bytes":4804325376}
+{"t":6.001843327,"elapsed_s":6.001843327,"ops":7125438,"ops_per_s":527530.7444283657,"rss_kb":516684,"map_bytes":301989952,"minflt":1595364,"majflt":1079,"read_bytes":78471168,"write_bytes":6357028864}
+{"t":7.000974359,"elapsed_s":7.000974359,"ops":7693021,"ops_per_s":568076.6404220744,"rss_kb":516788,"map_bytes":301989952,"minflt":2037699,"majflt":1379,"read_bytes":97804288,"write_bytes":7993327616}
+{"t":7.523649591,"elapsed_s":7.523649591,"ops":8000000,"ops_per_s":587322.6455084828,"rss_kb":517140,"map_bytes":301989952,"minflt":2265884,"majflt":1476,"read_bytes":107540480,"write_bytes":8925483008}

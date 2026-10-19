@@ -6,11 +6,12 @@
 // only; the production library (swisstable.go, forest.go) is untouched.
 //
 // Implementations:
-//   swiss  - production SwissPositionMap (presize controlled by BENCH_PRESIZE)
-//   lh     - hand-written linear hashing on an mmap'd file: one bucket split
-//            at a time, no O(N) rehash, no presize.
-//   bbolt  - go.etcd.io/bbolt (mmap B+tree); stores the full 32B key, so it
-//            does not need verifyHash at all.
+//
+//	swiss  - production SwissPositionMap (presize controlled by BENCH_PRESIZE)
+//	lh     - hand-written linear hashing on an mmap'd file: one bucket split
+//	         at a time, no O(N) rehash, no presize.
+//	bbolt  - go.etcd.io/bbolt (mmap B+tree); stores the full 32B key, so it
+//	         does not need verifyHash at all.
 package swisstable
 
 import (
@@ -51,6 +52,8 @@ func l1NewImpl(impl, dir string, expectedEntries uint64, src HashSource, posMask
 		return &l1SwissPosmap{m: m}, nil
 	case "lh":
 		return l1NewLH(dir, expectedEntries, src, posMask)
+	case "eh", "eh8":
+		return l1NewEH(dir, expectedEntries, src, posMask)
 	case "bbolt":
 		return l1NewBbolt(dir)
 	default:
@@ -64,14 +67,14 @@ func l1NewImpl(impl, dir string, expectedEntries uint64, src HashSource, posMask
 
 type l1SwissPosmap struct{ m *SwissPositionMap }
 
-func (s *l1SwissPosmap) Set(h [32]byte, p uint64) error         { return s.m.Set(h, p) }
-func (s *l1SwissPosmap) Get(h [32]byte) (uint64, bool, error)   { return s.m.Get(h) }
-func (s *l1SwissPosmap) Delete(h [32]byte) (bool, error)        { return s.m.Delete(h) }
-func (s *l1SwissPosmap) Count() uint64                          { return s.m.Count() }
-func (s *l1SwissPosmap) ForEach(fn func(uint64))                { s.m.ForEach(fn) }
-func (s *l1SwissPosmap) NumSlots() uint64                       { return s.m.numSlots }
-func (s *l1SwissPosmap) DropCache()                             { l1DropCache(s.m.ctrlFile); l1DropCache(s.m.slotsFile) }
-func (s *l1SwissPosmap) Close() error                           { return s.m.Close() }
+func (s *l1SwissPosmap) Set(h [32]byte, p uint64) error       { return s.m.Set(h, p) }
+func (s *l1SwissPosmap) Get(h [32]byte) (uint64, bool, error) { return s.m.Get(h) }
+func (s *l1SwissPosmap) Delete(h [32]byte) (bool, error)      { return s.m.Delete(h) }
+func (s *l1SwissPosmap) Count() uint64                        { return s.m.Count() }
+func (s *l1SwissPosmap) ForEach(fn func(uint64))              { s.m.ForEach(fn) }
+func (s *l1SwissPosmap) NumSlots() uint64                     { return s.m.numSlots }
+func (s *l1SwissPosmap) DropCache()                           { l1DropCache(s.m.ctrlFile); l1DropCache(s.m.slotsFile) }
+func (s *l1SwissPosmap) Close() error                         { return s.m.Close() }
 func (s *l1SwissPosmap) MapBytes() uint64 {
 	return uint64(fileHeaderSize) + s.m.numSlots + uint64(fileHeaderSize) + s.m.numSlots*8
 }
