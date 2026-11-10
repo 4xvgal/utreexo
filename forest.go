@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/utreexo/utreexo/internal/mmapfile"
-	"github.com/utreexo/utreexo/internal/swisstable"
 	"golang.org/x/exp/slices"
 )
 
@@ -276,8 +275,9 @@ type Forest struct {
 	// positionMap maps leaf hashes to packed (addIndex, position) values.
 	// Upper 17 bits = addIndex (index within Modify batch), lower 47 bits = position.
 	// Only tracks leaves (row 0), not intermediate nodes.
-	// Uses Swiss Table with mmap'd files for memory efficiency.
-	positionMap *swisstable.SwissPositionMap
+	// The production implementation is the Swiss Table in internal/swisstable,
+	// behind the PositionMap interface so alternatives can be plugged in.
+	positionMap PositionMap
 
 	// deletedLeafPositions tracks which leaf positions have been deleted.
 	// Persisted via the WAL (dirty words are serialized during flush).
@@ -420,7 +420,7 @@ func newForest(file, blockCountsFile, metaFile *cachedRWS, bitmap *deletedBitmap
 	if expectedMaxLeaves == 0 {
 		expectedEntries = max(expectedEntries, 1<<16)
 	}
-	posMap, needsRebuild, err := swisstable.NewSwissPositionMap(posMapCtrlPath, posMapSlotsPath, expectedEntries, consistencyHash, file, positionMask)
+	posMap, needsRebuild, err := newPositionMap(posMapCtrlPath, posMapSlotsPath, expectedEntries, consistencyHash, file, positionMask)
 	if err != nil {
 		return nil, fmt.Errorf("create position map: %w", err)
 	}
